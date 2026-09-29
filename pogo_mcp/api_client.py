@@ -2,9 +2,12 @@
 
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+import httpx
 
 from .pogo_types import (
     EggInfo,
@@ -24,21 +27,49 @@ from .pogo_types import (
 logger = logging.getLogger(__name__)
 
 
+# Where the hourly scraper (.github/workflows/scrape-pokemon-data.yml) publishes
+# its output. Set POGO_MCP_DATA_URL to another base URL, or to "local" to read
+# only the bundled data/ files.
+DEFAULT_DATA_URL = "https://raw.githubusercontent.com/GhostTypes/pokemon-go-mcp/data"
+DEFAULT_CACHE_TTL = 3600  # the scraper runs hourly, so anything fresher is noise
+ENDPOINTS = ("events", "raids", "research", "eggs", "rocket-lineups", "promo-codes")
+
+
 class LeekDuckAPIClient:
-    """Client for fetching Pokemon Go data using local scraper."""
+    """Client for the scraped LeekDuck data.
+
+    Order of preference per endpoint: a fresh on-disk cache, the live data branch,
+    a stale on-disk cache, and finally the data/ files bundled with the package.
+    """
 
     def __init__(self, timeout: int = 30) -> None:
         """Initialize the API client."""
         self.timeout = timeout
         self._cache: dict[str, list[dict[str, Any]]] = {}
         self._cache_timestamp: dict[str, datetime] = {}
-        self._cache_duration = 86400  # 24 hours cache
+        self._cache_duration = int(
+            os.environ.get("POGO_MCP_CACHE_TTL", DEFAULT_CACHE_TTL)
+        )
+        self.data_url = os.environ.get("POGO_MCP_DATA_URL", DEFAULT_DATA_URL).rstrip(
+            "/"
+        )
+        self.last_source: dict[str, str] = {}
 
-        # Path to local scraped data directory
+        # Path to the data directory bundled with the package (offline fallback)
         self._local_data_dir = Path(__file__).parent.parent / "data"
 
+        xdg = os.environ.get("XDG_CACHE_HOME")
+        cache_root = Path(xdg) if xdg else Path("~/.cache").expanduser()
+        override = os.environ.get("POGO_MCP_CACHE_DIR")
+        self._cache_dir = Path(override) if override else cache_root / "pogo-mcp"
+
+    @property
+    def uses_network(self) -> bool:
+        """Whether the client fetches from the data branch at all."""
+        return self.data_url.lower() != "local"
+
     def _load_local_data(self, endpoint: str) -> list[dict[str, Any]]:
-        """Load data from local JSON files."""
+        """Load data from the bundled JSON files."""
         local_file = self._local_data_dir / f"{endpoint}.json"
 
         if not local_file.exists():
@@ -56,23 +87,85 @@ class LeekDuckAPIClient:
             logger.exception("Error loading local %s data", endpoint)
             return []
 
+    def _read_cache_file(
+        self, endpoint: str
+    ) -> tuple[list[dict[str, Any]] | None, float]:
+        """Return (data, age in seconds) for the on-disk cache, or (None, inf)."""
+        path = self._cache_dir / f"{endpoint}.json"
+        try:
+            age = datetime.now(timezone.utc).timestamp() - path.stat().st_mtime
+            with path.open(encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None, float("inf")
+        if not isinstance(data, list):
+            return None, float("inf")
+        return data, age
+
+    def _write_cache_file(self, endpoint: str, data: list[dict[str, Any]]) -> None:
+        """Persist fetched data so restarts and offline runs do not hit the network."""
+        try:
+            self._cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self._cache_dir / f"{endpoint}.json.tmp"
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(data, f)
+            tmp.replace(self._cache_dir / f"{endpoint}.json")
+        except OSError:
+            logger.warning("Could not write cache for %s", endpoint, exc_info=True)
+
+    async def _download(self, endpoint: str) -> list[dict[str, Any]] | None:
+        """Fetch one endpoint from the data branch; None on any failure."""
+        url = f"{self.data_url}/{endpoint}.json"
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                data = response.json()
+        except (httpx.HTTPError, ValueError):
+            logger.warning("Could not fetch %s", url, exc_info=True)
+            return None
+        if not isinstance(data, list):
+            logger.warning("Unexpected payload shape from %s", url)
+            return None
+        logger.info("Fetched %d items for %s from %s", len(data), endpoint, url)
+        return data
+
+    async def _load_data(self, endpoint: str) -> list[dict[str, Any]]:
+        """Resolve one endpoint through the fallback chain."""
+        cached, age = self._read_cache_file(endpoint)
+        if cached is not None and age < self._cache_duration:
+            self.last_source[endpoint] = f"disk cache ({int(age)}s old)"
+            return cached
+
+        if self.uses_network:
+            fetched = await self._download(endpoint)
+            if fetched is not None:
+                self._write_cache_file(endpoint, fetched)
+                self.last_source[endpoint] = self.data_url
+                return fetched
+
+        if cached is not None:
+            self.last_source[endpoint] = f"stale disk cache ({int(age)}s old)"
+            return cached
+
+        self.last_source[endpoint] = "bundled data/ files"
+        return self._load_local_data(endpoint)
+
     async def _fetch_data(self, endpoint: str) -> list[dict[str, Any]]:
-        """Fetch data from local files with simple caching."""
+        """Fetch data with an in-memory cache in front of the fallback chain."""
         now = datetime.now(timezone.utc)
 
-        # Check if we have fresh cached data
+        stamp = self._cache_timestamp.get(endpoint)
         if (
             endpoint in self._cache
-            and endpoint in self._cache_timestamp
-            and (now - self._cache_timestamp[endpoint]).seconds < self._cache_duration
+            and stamp is not None
+            and (now - stamp).total_seconds() < self._cache_duration
         ):
             logger.info("Using cached data for %s", endpoint)
             return self._cache[endpoint]
 
-        # Load from local file
-        data = self._load_local_data(endpoint)
+        data = await self._load_data(endpoint)
 
-        # Cache the data
         self._cache[endpoint] = data
         self._cache_timestamp[endpoint] = now
 
@@ -421,11 +514,18 @@ class LeekDuckAPIClient:
         }
 
     def clear_cache(self) -> None:
-        """Clear the data cache."""
+        """Clear the in-memory and on-disk caches so the next call refetches."""
         self._cache.clear()
         self._cache_timestamp.clear()
-        logger.info("Cache cleared")
+        self.last_source.clear()
+        for endpoint in ENDPOINTS:
+            self._drop_cache_file(endpoint)
 
+    def _drop_cache_file(self, endpoint: str) -> None:
+        try:
+            (self._cache_dir / f"{endpoint}.json").unlink(missing_ok=True)
+        except OSError:
+            logger.warning("Could not remove cached %s", endpoint, exc_info=True)
 
 # Global API client instance
 _api_client_instance: Optional["LeekDuckAPIClient"] = None

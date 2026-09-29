@@ -561,8 +561,17 @@ def register_cross_cutting_tools() -> None:
 
             result += "## 💾 Cache Status\n\n"
             result += "\n".join(cache_info)
+            source = (
+                api_client.data_url
+                if api_client.uses_network
+                else "bundled data/ files"
+            )
             result += (
-                f"\n\n**Cache Duration:** {api_client._cache_duration}s (24 hours)\n"  # noqa: SLF001
+                f"\n\n**Cache Duration:** {api_client._cache_duration}s\n"  # noqa: SLF001
+                f"**Data source:** {source}\n"
+                + "".join(
+                    f"- {k}: {v}\n" for k, v in sorted(api_client.last_source.items())
+                )
             )
 
             # Available tools
